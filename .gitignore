@@ -13,3 +13,4 @@ results/
 # Virtual environments
 .venv
 .env
+data/
