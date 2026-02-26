@@ -7,11 +7,14 @@ dataset = FeverousEvidenceFormat.from_path("/raid/Workspace/an/code/factcheck/FE
 n = 0
 for sample in dataset:
     print('--------------------------------')
-    print('claim : ', sample['claim'])
-    # print('context : ', sample['context'])
+    print('claim : ', sample.claim)
     print('evidence : \n')
-    print(sample['evidence'])
-    print('label : ', sample['label'])
+    if sample.evidence:
+        for ev in sample.evidence:
+            print(ev.content)
+            if ev.context:
+                print('  context:', ev.context)
+    print('label : ', sample.label)
     print('--------------------------------\n\n')
     n += 1
     if n > 100:

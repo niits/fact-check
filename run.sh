@@ -1,0 +1,1 @@
+uv run python benchmark_feverous.py -o ./results/feverous-simple-evidence-format.csv --with-evidence --experiment-name /Shared/feverous-fact-check -c 1

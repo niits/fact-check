@@ -1,5 +1,8 @@
 import asyncio
 import csv
+import hashlib
+import inspect
+import pickle
 import zipfile
 from pathlib import Path
 
@@ -7,14 +10,21 @@ import click
 import mlflow
 from dotenv import load_dotenv
 from llama_index.llms.openai import OpenAI
+from openai import RateLimitError
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 
 from src.impls.events.base import FactCheckStartEvent
 from src.impls.workflows.simple import (
     EvidenceSimpleBaseFactCheck,
-    SimpleBaseFactCheck
+    SimpleBaseFactCheck,
+    StructuredEvidenceFactCheck,
 )
-from src.modules.datasets.feverous import FeverousEvidenceFormat
+from src.modules.datasets.feverous import (
+    FeverousEvidenceFormat,
+    FeverousStructuredFormat,
+)
+from src.modules.datasets.feverous.models import FeverousSample
 from src.modules.evaluator import evaluate_file
 
 load_dotenv()
@@ -105,76 +115,177 @@ def download_feverous_data(data_dir: Path) -> None:
                     with zf.open(member) as src, open(dest, "wb") as dst:
                         dst.write(src.read())
 
+
+def _dataset_source_hash(dataset) -> str:
+    """Hash the source code of the dataset class + its module for cache invalidation."""
+    cls = type(dataset)
+    module = inspect.getmodule(cls)
+    source = inspect.getsource(module) if module else inspect.getsource(cls)
+    return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+
+def _count_lines(path: str) -> int:
+    """Count non-empty lines in a JSONL file (minus header)."""
+    with open(path, "rb") as f:
+        total = sum(1 for _ in f)
+    return max(total - 1, 0)  # subtract header line
+
+
+def load_dataset_cached(
+    dataset,
+    data_path: str,
+    db_path: str,
+    cache_dir: Path = Path(".cache"),
+) -> list[FeverousSample]:
+    """Materialize dataset with tqdm progress, caching results on disk.
+
+    Cache is keyed on data_path, db_path, and a hash of the dataset class
+    source code. If the implementation changes, the cache is automatically
+    invalidated.
+    """
+    source_hash = _dataset_source_hash(dataset)
+    cache_key = hashlib.sha256(
+        f"{Path(data_path).resolve()}:{Path(db_path).resolve()}:{source_hash}".encode()
+    ).hexdigest()[:20]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"feverous_{cache_key}.pkl"
+
+    if cache_path.exists():
+        print(f"[benchmark] Loading cached dataset from {cache_path}")
+        with open(cache_path, "rb") as f:
+            samples = pickle.load(f)
+        print(f"[benchmark] Loaded {len(samples)} cached samples")
+        return samples
+
+    total = _count_lines(data_path)
+    print(f"[benchmark] Materializing dataset ({total} annotations)...")
+    samples = list(tqdm(dataset, total=total, desc="Loading dataset", unit="sample"))
+
+    with open(cache_path, "wb") as f:
+        pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[benchmark] Cached {len(samples)} samples to {cache_path}")
+    return samples
+
+
 async def process_sample(
     i: int,
-    sample: dict,
+    sample: FeverousSample,
     wf,
     with_evidence: bool,
     semaphore: asyncio.Semaphore,
+    max_retries: int = 10,
 ) -> dict | None:
     async with semaphore:
-        try:
-            context = sample["context"]
-            claim = sample["claim"]
-            evidence = sample["evidence"]
-            label = sample["label"]
+        for attempt in range(max_retries + 1):
+            try:
+                claim = sample.claim
+                evidence = sample.evidence if with_evidence else None
+                label = sample.label
 
-            start_ev = FactCheckStartEvent(
-                context=evidence if with_evidence else "",
-                claim=claim,
-            )
-            output = await wf.run(start_event=start_ev)
+                start_ev = FactCheckStartEvent(
+                    claim=claim,
+                    evidence=evidence,
+                )
+                output = await wf.run(start_event=start_ev)
 
-            result = output.result if hasattr(output, "result") else output
-            if isinstance(result, dict):
-                prediction = str(result.get("label"))
-            else:
-                prediction = str(result)
+                result = output.result if hasattr(output, "result") else output
+                if isinstance(result, dict):
+                    prediction = str(result.get("label"))
+                else:
+                    prediction = str(result)
 
-            return {
-                "idx": i,
-                "context": context,
-                "claim": claim,
-                "evidence": evidence,
-                "label": label,
-                "pred": prediction,
-            }
+                # Serialize evidence for CSV output
+                evidence_str = sample.model_dump_json() if evidence else ""
 
-        except (KeyError, ValueError, RuntimeError) as e:
-            print(f"[benchmark] error at idx={i}: {e}")
-            return None
+                return {
+                    "idx": i,
+                    "claim": claim,
+                    "evidence": evidence_str,
+                    "label": label,
+                    "pred": prediction,
+                }
+
+            except RateLimitError as e:
+                retry_after = (
+                    float(e.response.headers.get("retry-after", 0)) if e.response else 0
+                )
+                wait = max(retry_after, 1.0)
+                if attempt < max_retries:
+                    print(
+                        f"[benchmark] idx={i} rate limited, retry {attempt+1}/{max_retries} after {wait:.1f}s"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    print(
+                        f"[benchmark] idx={i} rate limited, exhausted {max_retries} retries"
+                    )
+                    return None
+
+            except (KeyError, ValueError, RuntimeError) as e:
+                print(f"[benchmark] error at idx={i}: {e}")
+                return None
 
 
 async def benchmark(
-    dataset,
+    samples: list[FeverousSample],
     wf,
     output_file: str,
     with_evidence: bool,
     max_concurrency: int = 10,
 ) -> None:
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["context", "claim", "evidence", "label", "pred"]
+    fieldnames = ["claim", "evidence", "label", "pred"]
 
     semaphore = asyncio.Semaphore(max_concurrency)
-    samples = list(dataset)
-    print(f"[benchmark] Starting benchmark with {len(samples)} samples (concurrency={max_concurrency})")
+    print(
+        f"[benchmark] Starting benchmark with {len(samples)} samples (concurrency={max_concurrency})"
+    )
 
     tasks = [
         process_sample(
-            i, sample, wf, with_evidence, semaphore,
+            i,
+            sample,
+            wf,
+            with_evidence,
+            semaphore,
         )
         for i, sample in enumerate(samples)
     ]
 
     raw_results: list[dict | None] = []
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+    labels_so_far: list[str] = []
+    preds_so_far: list[str] = []
+    all_labels = ["SUPPORT", "REFUTE", "NEI"]
+
+    pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
+    for coro in pbar:
         result = await coro
         raw_results.append(result)
+        if result and result["label"] and result["pred"]:
+            labels_so_far.append(result["label"])
+            preds_so_far.append(result["pred"])
+            n = len(labels_so_far)
+            if n >= 2 and n % 50 == 0:
+                macro_f1 = f1_score(
+                    labels_so_far,
+                    preds_so_far,
+                    labels=all_labels,
+                    average="macro",
+                    zero_division=0,
+                )
+                acc = sum(l == p for l, p in zip(labels_so_far, preds_so_far)) / n
+                pbar.set_postfix(
+                    f1=f"{macro_f1:.3f}",
+                    acc=f"{acc:.3f}",
+                    ok=n,
+                )
 
     # Sort by original index and write
     results: list[dict] = [r for r in raw_results if r is not None]
     results.sort(key=lambda r: r["idx"])
-    print(f"[benchmark] Completed {len(results)}/{len(samples)} samples, writing to {output_file}")
+    print(
+        f"[benchmark] Completed {len(results)}/{len(samples)} samples, writing to {output_file}"
+    )
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -182,7 +293,6 @@ async def benchmark(
         for r in results:
             writer.writerow(
                 {
-                    "context": r["context"],
                     "claim": r["claim"],
                     "evidence": r["evidence"],
                     "label": r["label"],
@@ -228,6 +338,14 @@ async def benchmark(
     help="Whether to include evidence (instead of raw context) in the fact-check input.",
 )
 @click.option(
+    "--format",
+    "evidence_format",
+    type=click.Choice(["evidence", "structured"], case_sensitive=False),
+    default="evidence",
+    show_default=True,
+    help="Evidence representation format: 'evidence' (bold markers) or 'structured' (XML tags).",
+)
+@click.option(
     "--concurrency",
     "-c",
     type=int,
@@ -260,6 +378,7 @@ def main(
     model: str,
     output: str,
     with_evidence: bool,
+    evidence_format: str,
     concurrency: int,
     download: bool,
     experiment_name: str,
@@ -282,16 +401,24 @@ def main(
             param_hint="'--db-path'",
         )
 
-    dataset = FeverousEvidenceFormat.from_path(data_path, db_path)
+    if evidence_format == "structured":
+        dataset = FeverousStructuredFormat.from_path(data_path, db_path)
+    else:
+        dataset = FeverousEvidenceFormat.from_path(data_path, db_path)
     llm = OpenAI(model=model)
 
     if with_evidence:
-        wf = EvidenceSimpleBaseFactCheck(llm=llm)
+        if evidence_format == "structured":
+            wf = StructuredEvidenceFactCheck(llm=llm)
+        else:
+            wf = EvidenceSimpleBaseFactCheck(llm=llm)
     else:
         wf = SimpleBaseFactCheck(llm=llm)
 
     workflow_name = type(wf).__name__
-    print(f"[benchmark] Model: {model}, output: {output}, with_evidence: {with_evidence}")
+    print(
+        f"[benchmark] Model: {model}, output: {output}, with_evidence: {with_evidence}, format: {evidence_format}"
+    )
 
     # --- MLflow setup ---
     if tracking_uri:
@@ -301,20 +428,29 @@ def main(
 
     with mlflow.start_run(run_name=f"{workflow_name}-{model}") as parent_run:
         # Log params
-        mlflow.log_params({
-            "model": model,
-            "workflow": workflow_name,
-            "with_evidence": with_evidence,
-            "concurrency": concurrency,
-            "data_path": data_path,
-            "db_path": db_path,
-            "output_file": output,
-        })
+        mlflow.log_params(
+            {
+                "model": model,
+                "workflow": workflow_name,
+                "with_evidence": with_evidence,
+                "evidence_format": evidence_format,
+                "concurrency": concurrency,
+                "data_path": data_path,
+                "db_path": db_path,
+                "output_file": output,
+            }
+        )
+
+        # Load dataset with caching + progress
+        samples = load_dataset_cached(dataset, data_path, db_path)
 
         # Run benchmark
         asyncio.run(
             benchmark(
-                dataset, wf, output, with_evidence,
+                samples,
+                wf,
+                output,
+                with_evidence,
                 max_concurrency=concurrency,
             )
         )
@@ -346,6 +482,7 @@ def main(
 
         # Log workflow source code as artifact
         import inspect
+
         wf_source = inspect.getsource(type(wf))
         mlflow.log_text(wf_source, "workflow_source.py")
 

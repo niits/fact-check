@@ -7,8 +7,15 @@ requires-python = ">=3.11"
 dependencies = [
     "click>=8.3.1",
     "datasets>=4.5.0",
+    "ipykernel>=7.2.0",
     "jsonlines>=4.0.0",
     "llama-index>=0.14.13",
     "mlflow>=3.9.0",
+    "ruff>=0.15.2",
     "scikit-learn>=1.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "black>=26.1.0",
 ]

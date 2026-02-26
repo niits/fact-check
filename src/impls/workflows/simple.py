@@ -1,16 +1,60 @@
-import re
+from enum import Enum
 
 from llama_index.core.llms import LLM
-from llama_index.core.prompts import ChatMessage
+from llama_index.core.prompts import PromptTemplate
+from pydantic import BaseModel, Field
 from workflows import Workflow, step
 from workflows.events import StopEvent
 
 from src.modules.prompts.simple import SIMPLE_USER, SIMPLE_REASONING_USER
 from src.modules.prompts.evidence_simple import (
+    EVIDENCE_SIMPLE_SYSTEM,
     EVIDENCE_SIMPLE_USER,
     EVIDENCE_SIMPLE_REASONING_USER,
 )
+from src.modules.prompts.evidence_structured import (
+    EVIDENCE_STRUCTURED_SYSTEM,
+    EVIDENCE_STRUCTURED_USER,
+    EVIDENCE_STRUCTURED_REASONING_USER,
+)
 from ..events.base import FactCheckStartEvent
+
+
+# ── Structured output models ─────────────────────────────────────────
+
+class FactCheckLabel(str, Enum):
+    """Constrained label enum for structured output."""
+    SUPPORTS = "SUPPORTS"
+    REFUTES = "REFUTES"
+    NOT_ENOUGH_INFO = "NOT ENOUGH INFO"
+
+
+class FactCheckResult(BaseModel):
+    """Structured output for fact-check classification."""
+    label: FactCheckLabel = Field(
+        description="The fact-check verdict: SUPPORTS, REFUTES, or NOT ENOUGH INFO"
+    )
+
+
+class FactCheckReasoningResult(BaseModel):
+    """Structured output for fact-check with reasoning."""
+    reasoning: str = Field(
+        description="Step-by-step reasoning explaining how the evidence relates to the claim"
+    )
+    label: FactCheckLabel = Field(
+        description="The fact-check verdict: SUPPORTS, REFUTES, or NOT ENOUGH INFO"
+    )
+
+
+_LABEL_MAP = {
+    FactCheckLabel.SUPPORTS: "SUPPORT",
+    FactCheckLabel.REFUTES: "REFUTE",
+    FactCheckLabel.NOT_ENOUGH_INFO: "NEI",
+}
+
+
+def _map_label(label: FactCheckLabel) -> str:
+    return _LABEL_MAP[label]
 
 
 class SimpleBaseFactCheck(Workflow):
@@ -26,26 +70,11 @@ class SimpleBaseFactCheck(Workflow):
     async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
         context = ev.context
         claim = ev.claim
-        prompt = ChatMessage(
-            content=SIMPLE_USER.format(
-                context=context,
-                claim=claim
-            ),
-            role="user"
+        prompt = PromptTemplate(SIMPLE_USER)
+        result = await self.llm.astructured_predict(
+            FactCheckResult, prompt, context=context, claim=claim
         )
-
-        response = await self.llm.achat([prompt])
-        label = response.message.content
-
-        # Convert label
-        if label.lower() == "yes":
-            label = "SUPPORT"
-        elif label.lower() == "no":
-            label = "REFUTE"
-        elif label.lower() == "not enough information":
-            label = "NEI"
-
-        return StopEvent(label)
+        return StopEvent(_map_label(result.label))
 
 
 class SimpleReasoningFactCheck(Workflow):
@@ -61,73 +90,54 @@ class SimpleReasoningFactCheck(Workflow):
     async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
         context = ev.context
         claim = ev.claim
-        prompt = ChatMessage(
-            content=SIMPLE_REASONING_USER.format(
-                context=context,
-                claim=claim
-            ),
-            role="user"
+        prompt = PromptTemplate(SIMPLE_REASONING_USER)
+        result = await self.llm.astructured_predict(
+            FactCheckReasoningResult, prompt, context=context, claim=claim
         )
-
-        response = await self.llm.achat([prompt])
-        content = response.message.content
-
-        # Parse
-        pattern = re.compile(
-            r"Reasoning:\s*(?P<reasoning>.*?)\s*Answer:\s*(?P<answer>Not Enough Information|Yes|No)",
-            re.DOTALL
-        )
-
-        match = pattern.search(content)
-
-        label = "Bug"
-        reasoning = "Bug"
-        if match:
-            reasoning = match.group("reasoning").strip()
-            answer = match.group("answer")
-
-            # Convert label
-            if answer.lower().strip() == "yes":
-                label = "SUPPORT"
-            elif answer.lower().strip() == "no":
-                label = "REFUTE"
-            elif answer.lower().strip() == "not enough information":
-                label = "NEI"
-
         return StopEvent({
-            "label": label,
-            "reasoning": reasoning
+            "label": _map_label(result.label),
+            "reasoning": result.reasoning,
         })
 
 
 class EvidenceSimpleBaseFactCheck(Workflow):
-    """Uses evidence_simple prompt. Pass evidence in ev.context (e.g. FeverousEvidenceFormat output)."""
+    """Uses evidence_simple prompt. Pass evidence as list[EvidenceItem]."""
 
     def __init__(self, llm: LLM, **kwargs):
         super().__init__(**kwargs)
         self.llm = llm
 
+    @staticmethod
+    def format_evidence(evidence: list) -> str:
+        """Format list of EvidenceItem into a structured prompt string."""
+        parts = []
+        for i, ev in enumerate(evidence, 1):
+            header = f"Evidence {i}"
+            if ev.source:
+                header += f" [Source: {ev.source}]"
+            header += ":"
+            section = [header, ev.content]
+            if ev.context:
+                section.append(f"Context: {ev.context}")
+            parts.append("\n".join(section))
+        return "\n\n".join(parts)
+
     @step
     async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
-        evidence = ev.context
+        evidence_str = self.format_evidence(ev.evidence) if ev.evidence else ""
         claim = ev.claim
-        prompt = ChatMessage(
-            content=EVIDENCE_SIMPLE_USER.format(evidence=evidence, claim=claim),
-            role="user",
+        prompt = PromptTemplate(
+            EVIDENCE_SIMPLE_USER,
+            metadata={"system_prompt": EVIDENCE_SIMPLE_SYSTEM},
         )
-        response = await self.llm.achat([prompt])
-        label = response.message.content
-        if label.lower() == "yes":
-            label = "SUPPORT"
-        elif label.lower() == "no":
-            label = "REFUTE"
-        elif label.lower() == "not enough information":
-            label = "NEI"
-        return StopEvent(label)
+        result = await self.llm.astructured_predict(
+            FactCheckResult, prompt, evidence=evidence_str, claim=claim
+        )
+        return StopEvent(_map_label(result.label))
 
 
 class EvidenceSimpleReasoningFactCheck(Workflow):
-    """Uses evidence_simple prompt with reasoning. Pass evidence in ev.context."""
+    """Uses evidence_simple prompt with reasoning."""
 
     def __init__(self, llm: LLM, **kwargs):
         super().__init__(**kwargs)
@@ -135,30 +145,61 @@ class EvidenceSimpleReasoningFactCheck(Workflow):
 
     @step
     async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
-        evidence = ev.context
+        evidence_str = EvidenceSimpleBaseFactCheck.format_evidence(ev.evidence) if ev.evidence else ""
         claim = ev.claim
-        prompt = ChatMessage(
-            content=EVIDENCE_SIMPLE_REASONING_USER.format(
-                evidence=evidence, claim=claim
-            ),
-            role="user",
+        prompt = PromptTemplate(
+            EVIDENCE_SIMPLE_REASONING_USER,
+            metadata={"system_prompt": EVIDENCE_SIMPLE_SYSTEM},
         )
-        response = await self.llm.achat([prompt])
-        content = response.message.content
-        pattern = re.compile(
-            r"Reasoning:\s*(?P<reasoning>.*?)\s*Answer:\s*(?P<answer>Not Enough Information|Yes|No)",
-            re.DOTALL,
+        result = await self.llm.astructured_predict(
+            FactCheckReasoningResult, prompt, evidence=evidence_str, claim=claim
         )
-        match = pattern.search(content)
-        label = "Bug"
-        reasoning = "Bug"
-        if match:
-            reasoning = match.group("reasoning").strip()
-            answer = match.group("answer")
-            if answer.lower().strip() == "yes":
-                label = "SUPPORT"
-            elif answer.lower().strip() == "no":
-                label = "REFUTE"
-            elif answer.lower().strip() == "not enough information":
-                label = "NEI"
-        return StopEvent({"label": label, "reasoning": reasoning})
+        return StopEvent({
+            "label": _map_label(result.label),
+            "reasoning": result.reasoning,
+        })
+
+
+class StructuredEvidenceFactCheck(Workflow):
+    """Uses structured XML evidence format with system prompt."""
+
+    def __init__(self, llm: LLM, **kwargs):
+        super().__init__(**kwargs)
+        self.llm = llm
+
+    @step
+    async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
+        evidence_str = ev.evidence if isinstance(ev.evidence, str) else ""
+        claim = ev.claim
+        prompt = PromptTemplate(
+            EVIDENCE_STRUCTURED_USER,
+            metadata={"system_prompt": EVIDENCE_STRUCTURED_SYSTEM},
+        )
+        result = await self.llm.astructured_predict(
+            FactCheckResult, prompt, evidence=evidence_str, claim=claim
+        )
+        return StopEvent(_map_label(result.label))
+
+
+class StructuredEvidenceReasoningFactCheck(Workflow):
+    """Uses structured XML evidence format with step-by-step reasoning."""
+
+    def __init__(self, llm: LLM, **kwargs):
+        super().__init__(**kwargs)
+        self.llm = llm
+
+    @step
+    async def fact_check(self, ev: FactCheckStartEvent) -> StopEvent:
+        evidence_str = ev.evidence if isinstance(ev.evidence, str) else ""
+        claim = ev.claim
+        prompt = PromptTemplate(
+            EVIDENCE_STRUCTURED_REASONING_USER,
+            metadata={"system_prompt": EVIDENCE_STRUCTURED_SYSTEM},
+        )
+        result = await self.llm.astructured_predict(
+            FactCheckReasoningResult, prompt, evidence=evidence_str, claim=claim
+        )
+        return StopEvent({
+            "label": _map_label(result.label),
+            "reasoning": result.reasoning,
+        })
