@@ -12,3 +12,4 @@ result/
 # Virtual environments
 .venv
 .env
+build_index_checkpoint.json
